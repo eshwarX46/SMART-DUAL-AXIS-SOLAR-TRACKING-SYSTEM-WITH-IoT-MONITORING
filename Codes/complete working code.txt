@@ -1,0 +1,1155 @@
+
+/*
+ ============================================================
+ ESP32 SMART DUAL-AXIS SOLAR TRACKER V3
+ ============================================================
+
+ Hardware:
+   ESP32 DevKit V1
+   4 x LDR + 10k voltage divider
+   2 x MG996R Servo Motors
+
+ Features:
+   - Noise-filtered LDR measurements
+   - Proportional tracking
+   - Hysteresis / deadband
+   - Direction confirmation
+   - Smooth 1-degree servo movement
+   - Mechanical angle limits
+   - Low-light and saturation protection
+   - Serial Monitor diagnostics
+
+ IMPORTANT:
+   - Use a separate regulated 5-6V servo supply
+   - Connect ESP32 GND to servo supply GND
+   - Never power MG996R from ESP32 3.3V
+   - Never apply 13.5V to servo supply
+   - Initial tracking direction must be verified
+ ============================================================
+*/
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <math.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+#include <LiquidCrystal_I2C.h>
+#include <stdio.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ==========================================================
+// 1. PIN CONFIGURATION
+// ==========================================================
+
+constexpr int LDR_TOP_PIN    = 34;
+constexpr int LDR_BOTTOM_PIN = 35;
+constexpr int LDR_LEFT_PIN   = 32;
+constexpr int LDR_RIGHT_PIN  = 33;
+
+constexpr int SERVO_H_PIN = 13;
+constexpr int SERVO_V_PIN = 14;
+
+// DS18B20 temperature sensor (1-Wire data)
+constexpr int TEMP_PIN = 4;
+
+// Shared I2C bus: both LCD and INA219 use these two pins.
+constexpr int I2C_SDA_PIN = 21;
+constexpr int I2C_SCL_PIN = 22;
+constexpr uint8_t INA_I2C_ADDR = 0x40;
+
+
+// ==========================================================
+// Wi-Fi / local-only web dashboard and MANUAL relay control
+// ==========================================================
+// Router-only mode: connect using the private, password-protected 2.4 GHz network.
+// The dashboard has NO separate username or password.
+constexpr const char* WIFI_SSID = "V8";
+constexpr const char* WIFI_PASSWORD = "eshwar46";
+
+// New GPIOs do not conflict with your existing wiring.
+constexpr int RELAY_PIN = 25;       // Relay control input on GPIO25
+constexpr bool RELAY_ACTIVE_LOW = false; // Active-HIGH relay: HIGH=ON, LOW=OFF
+
+// MANUAL ONLY: no battery voltage sensor or software battery cutoff.
+// Relay defaults to OFF at boot, then follows browser ON/OFF commands.
+// Battery-driven loads MUST use an independently protected battery/BMS.
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+// Added LCD address view; existing LCD readings are unchanged.
+constexpr unsigned long IP_REMINDER_PERIOD_MS = 20000; // Once every 20s
+constexpr unsigned long IP_REMINDER_SHOW_MS = 5000;    // Visible for 5s
+
+WebServer server(80);
+bool relayOn = false; // OFF at boot; changes only after browser command.
+unsigned long wifiStartMs = 0;
+unsigned long lastWifiCheck = 0;
+bool stationLoggedIn = false;
+unsigned long lastWifiRetry = 0;
+bool dashboardOpened = false; // Keep IP on LCD until a browser opens the dashboard.
+
+// HTML is served from flash; no cloud service or internet is needed.
+const char DASHBOARD_HTML[] PROGMEM = R"SOLARHTML(
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Solar Tracker | Live</title>
+<style>
+:root{color-scheme:dark;--bg:#090f1a;--card:#121d2e;--line:#273648;--muted:#97aabd;--cyan:#64ddeb;--white:#f6fbff;--good:#5fe3a9;--bad:#ff8c97}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -10%,#123344,transparent 45%),var(--bg);color:var(--white);font:16px system-ui,Arial,sans-serif}
+main{max-width:1100px;margin:auto;padding:24px 16px 60px}
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:26px}small{color:var(--muted)}h1{font-size:clamp(23px,4vw,34px);margin:4px 0;font-weight:750}h2{font-size:17px;margin:0 0 14px}
+.pill{display:inline-block;border-radius:30px;border:1px solid #3a6670;background:#13353b;color:var(--cyan);padding:7px 11px;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:12px}.card{border:1px solid var(--line);border-radius:15px;background:var(--card);padding:20px}
+.label{font-size:12px;letter-spacing:.075em;text-transform:uppercase;color:var(--muted)}.value{margin-top:8px;font-size:clamp(26px,4vw,34px);font-weight:720;font-variant-numeric:tabular-nums}
+.unit{font-size:14px;color:var(--muted);font-weight:400}.section{margin-top:22px}.detail{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:10px 0;color:var(--muted)}.detail strong{color:var(--white)}
+.buttons{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}button{border:1px solid #54727e;color:var(--white);background:#1a3247;border-radius:10px;padding:13px 7px;font-weight:700;cursor:pointer}
+button:hover{background:#244964}button.selected{color:#052126;background:var(--cyan);border-color:var(--cyan)}button:disabled{opacity:.35;cursor:not-allowed}
+.note{color:var(--muted);line-height:1.6;font-size:13px}.warn{color:var(--bad)}.good{color:var(--good)}#status{min-height:21px;font-size:13px;margin-top:10px}.foot{margin-top:24px;color:var(--muted);font-size:12px}
+</style></head><body><main>
+<header><div><small>ESP32 / LOCAL CONTROL</small><h1>Smart Solar Tracker</h1><small>Live energy and dual-axis tracking dashboard</small></div><span class="pill" id="online">Connecting...</span></header>
+<section class="grid">
+<div class="card"><div class="label">Solar Voltage</div><div class="value" id="solarV">--</div></div>
+<div class="card"><div class="label">Solar Current</div><div class="value" id="solarI">--</div></div>
+<div class="card"><div class="label">Solar Power</div><div class="value" id="solarP">--</div></div>
+<div class="card"><div class="label">Panel Temperature</div><div class="value" id="temp">--</div></div>
+<div class="card"><div class="label">Tracking Status</div><div class="value" id="tracking">--</div><small id="angles">H --° / V --°</small></div>
+</section>
+<section class="grid section"><div class="card"><h2>Light sensors (12-bit ADC)</h2><div class="detail"><span>Top</span><strong id="top">--</strong></div><div class="detail"><span>Bottom</span><strong id="bottom">--</strong></div><div class="detail"><span>Left</span><strong id="left">--</strong></div><div class="detail"><span>Right</span><strong id="right">--</strong></div><div class="detail"><span>H / V error</span><strong id="err">--</strong></div></div>
+<div class="card"><h2>Load relay — manual control</h2><div class="detail"><span>Relay command</span><strong id="load">OFF</strong></div><div class="detail"><span>Control mode</span><strong>Browser ON / OFF</strong></div><p class="note">No automatic battery protection. Use a battery with an appropriate BMS and fused load wiring. The relay starts OFF after each restart.</p><div class="buttons"><button data-mode="on">TURN ON</button><button data-mode="off">TURN OFF</button></div><div id="status" role="status"></div></div></section>
+<div class="foot">Data refresh: 1 second · Only available on the ESP32 local network · Never expose this HTTP server to the internet.</div>
+</main><script>
+const $=id=>document.getElementById(id);
+const number=(v,d=2,u='')=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d)+(u?'<span class="unit"> '+u+'</span>':''):'--';
+const text=(id,v)=>$(id).textContent=String(v);
+async function refresh(){try{let r=await fetch('/api/data',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);let d=await r.json();
+$('online').textContent='LIVE';$('solarV').innerHTML=number(d.solar_v,2,'V');$('solarI').innerHTML=number(d.solar_a,3,'A');$('solarP').innerHTML=number(d.solar_w,2,'W');$('temp').innerHTML=number(d.temp_c,1,'°C');
+text('tracking',d.tracking);text('angles',`H ${d.h}° / V ${d.v}°`);text('top',d.top);text('bottom',d.bottom);text('left',d.left);text('right',d.right);text('err',`${d.error_h}% / ${d.error_v}%`);
+text('load',d.relay_on?'ON':'OFF');$('load').className=d.relay_on?'good':'warn';document.querySelectorAll('button[data-mode]').forEach(b=>b.classList.toggle('selected',b.dataset.mode===(d.relay_on?'on':'off')));
+}catch(e){$('online').textContent='DISCONNECTED';console.log(e)}}
+async function setMode(mode){$('status').textContent='Applying...';try{let r=await fetch('/api/load',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+encodeURIComponent(mode)});let t=await r.text();$('status').textContent=(r.ok?'':('Error: '))+t;await refresh()}catch(e){$('status').textContent='Request failed'}}
+document.querySelectorAll('button[data-mode]').forEach(b=>b.onclick=()=>setMode(b.dataset.mode));refresh();setInterval(refresh,1000);
+</script></body></html>
+)SOLARHTML";
+
+// ==========================================================
+// 2. SERVO CONFIGURATION
+// ==========================================================
+
+Servo servoH;
+Servo servoV;
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature temperatureSensor(&oneWire);
+
+// LCD address is discovered once during setup (0x27 or 0x3F).
+LiquidCrystal_I2C lcd27(0x27, 16, 2);
+LiquidCrystal_I2C lcd3F(0x3F, 16, 2);
+LiquidCrystal_I2C* lcd = nullptr;
+Adafruit_INA219 ina219(INA_I2C_ADDR);
+
+int posH = 90;
+int posV = 90;
+
+// Start with conservative mechanical limits.
+// Adjust only after inspecting the mount.
+
+constexpr int H_MIN = 30;
+constexpr int H_MAX = 180;
+
+constexpr int V_MIN = 30;
+constexpr int V_MAX = 180;
+
+// Change 1 to -1 if an axis moves the wrong way.
+
+constexpr int H_DIRECTION = 1;
+constexpr int V_DIRECTION = 1;
+
+// Pulse widths: conservative starting values.
+
+constexpr int SERVO_MIN_US = 1000;
+constexpr int SERVO_MAX_US = 2000;
+
+// ==========================================================
+// 3. TRACKING PARAMETERS
+// ==========================================================
+
+// Sensor readings use the ESP32 12-bit ADC.
+
+constexpr int ADC_MAX_VALUE = 4095;
+
+// Normalized difference:
+// 100 * (sensorA - sensorB) / (sensorA + sensorB)
+
+constexpr float START_ERROR = 7.0f;
+constexpr float STOP_ERROR  = 3.0f;
+
+// Proportional response determines how quickly
+// the desired target changes, not motor speed.
+
+constexpr float KP = 0.18f;
+
+// Limit each target update to 3 degrees.
+
+constexpr float MAX_TARGET_CHANGE = 7.0f;
+
+// Actual commanded servo movement is limited
+// to 1 degree per SERVO_INTERVAL.
+
+constexpr int SERVO_STEP = 3;
+
+// ==========================================================
+// 4. TIMING
+// ==========================================================
+
+constexpr unsigned long SENSOR_INTERVAL = 60;
+constexpr unsigned long TRACK_INTERVAL  = 100;
+constexpr unsigned long SERVO_INTERVAL  = 15;
+constexpr unsigned long PRINT_INTERVAL  = 500;
+
+// Added temperature timing (DS18B20, 12-bit resolution)
+constexpr unsigned long TEMP_INTERVAL = 1000;
+constexpr unsigned long TEMP_CONVERSION_MS = 750;
+
+// Added display/electrical polling; existing intervals unchanged.
+constexpr unsigned long INA_INTERVAL = 1000;
+constexpr unsigned long LCD_INTERVAL = 1000;
+constexpr unsigned long LCD_PAGE_DURATION = 4000;
+
+// ==========================================================
+// 5. FILTER SETTINGS
+// ==========================================================
+
+constexpr int ADC_SAMPLES = 16;
+
+// 0 < FILTER_ALPHA <= 1
+// Smaller = smoother but slower
+
+constexpr float FILTER_ALPHA = 0.18f;
+
+// ==========================================================
+// 6. SAFETY SETTINGS
+// ==========================================================
+
+// These assume bright light produces HIGHER ADC values.
+// Calibrate these thresholds with your real LDRs.
+
+// Prevent tracking in extremely low light.
+constexpr float MIN_AVG_LIGHT = 120.0f;
+
+// Prevent tracking when all sensors are saturated.
+constexpr float SATURATION_LEVEL = 4050.0f;
+
+// Require repeated confirmation before changing
+// the direction of an axis.
+
+constexpr int DIRECTION_CONFIRM = 3;
+
+// ==========================================================
+// 7. GLOBAL VARIABLES
+// ==========================================================
+
+float ldrTop = 0;
+float ldrBottom = 0;
+float ldrLeft = 0;
+float ldrRight = 0;
+
+float errorH = 0;
+float errorV = 0;
+
+float targetH = 90;
+float targetV = 90;
+
+bool sensorReady = false;
+bool lightValid = false;
+
+unsigned long lastSensor = 0;
+unsigned long lastTrack = 0;
+unsigned long lastServo = 0;
+unsigned long lastPrint = 0;
+
+// Added temperature state. Tracking state above is unchanged.
+float tempC = NAN;
+bool tempValid = false;
+bool tempConversionPending = false;
+unsigned long lastTempRequest = 0;
+
+// Additional electrical and LCD state; independent of the tracker.
+bool inaReady = false;
+bool inaValid = false;
+float solarVoltage_V = NAN;
+float solarCurrent_mA = NAN;
+float solarPower_mW = NAN;
+unsigned long lastINA = 0;
+unsigned long lastLCD = 0;
+
+int activeH = 0;
+int activeV = 0;
+
+int candidateH = 0;
+int candidateV = 0;
+
+int countH = 0;
+int countV = 0;
+
+// ==========================================================
+// 8. SENSOR READING
+// ==========================================================
+
+float readAverageADC(int pin) {
+
+  uint32_t total = 0;
+
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    total += analogRead(pin);
+    delayMicroseconds(150);
+  }
+
+  return (float)total / ADC_SAMPLES;
+}
+
+// ==========================================================
+// 9. EXPONENTIAL FILTER
+// ==========================================================
+
+float smoothADC(float previous, float current) {
+
+  return previous +
+         FILTER_ALPHA * (current - previous);
+}
+
+// ==========================================================
+// 10. NORMALIZED TRACKING ERROR
+// ==========================================================
+
+float calculateError(float a, float b) {
+
+  float sum = a + b;
+
+  if (sum < 1.0f) {
+    return 0.0f;
+  }
+
+  return 100.0f * (a - b) / sum;
+}
+
+// ==========================================================
+// 11. DIRECTION DETECTION
+// ==========================================================
+
+int confirmDirection(
+    float error,
+    int &active,
+    int &candidate,
+    int &counter) {
+
+  float magnitude = fabsf(error);
+
+  if (magnitude <= STOP_ERROR) {
+
+    active = 0;
+    candidate = 0;
+    counter = 0;
+
+    return 0;
+  }
+
+  int desired = (error > 0) ? 1 : -1;
+
+  if (active == desired) {
+    return active;
+  }
+
+  // Require a larger error to START movement.
+
+  if (magnitude < START_ERROR) {
+
+    active = 0;
+    candidate = 0;
+    counter = 0;
+
+    return 0;
+  }
+
+  if (candidate == desired) {
+    counter++;
+  } else {
+    candidate = desired;
+    counter = 1;
+  }
+
+  if (counter >= DIRECTION_CONFIRM) {
+
+    active = desired;
+    candidate = 0;
+    counter = 0;
+  } else {
+    active = 0;
+  }
+
+  return active;
+}
+
+// ==========================================================
+// 12. SENSOR UPDATE
+// ==========================================================
+
+void updateSensors() {
+
+  float t = readAverageADC(LDR_TOP_PIN);
+  float b = readAverageADC(LDR_BOTTOM_PIN);
+  float l = readAverageADC(LDR_LEFT_PIN);
+  float r = readAverageADC(LDR_RIGHT_PIN);
+
+  if (!sensorReady) {
+
+    ldrTop = t;
+    ldrBottom = b;
+    ldrLeft = l;
+    ldrRight = r;
+
+    sensorReady = true;
+
+  } else {
+
+    ldrTop = smoothADC(ldrTop, t);
+    ldrBottom = smoothADC(ldrBottom, b);
+    ldrLeft = smoothADC(ldrLeft, l);
+    ldrRight = smoothADC(ldrRight, r);
+  }
+
+  float avgLight =
+      (ldrTop + ldrBottom +
+       ldrLeft + ldrRight) / 4.0f;
+
+  bool tooDark = avgLight < MIN_AVG_LIGHT;
+
+  bool saturated =
+      ldrTop >= SATURATION_LEVEL &&
+      ldrBottom >= SATURATION_LEVEL &&
+      ldrLeft >= SATURATION_LEVEL &&
+      ldrRight >= SATURATION_LEVEL;
+
+  lightValid = !tooDark && !saturated;
+
+  errorV = calculateError(
+      ldrTop,
+      ldrBottom
+  );
+
+  errorH = calculateError(
+      ldrLeft,
+      ldrRight
+  );
+}
+
+// ==========================================================
+// 13. TRACKING CONTROL
+// ==========================================================
+
+void updateTracking() {
+
+  if (!lightValid) {
+
+    activeH = 0;
+    activeV = 0;
+
+    candidateH = 0;
+    candidateV = 0;
+
+    countH = 0;
+    countV = 0;
+
+    // Hold present commanded position.
+    targetH = posH;
+    targetV = posV;
+
+    return;
+  }
+
+  int dirH = confirmDirection(
+      errorH,
+      activeH,
+      candidateH,
+      countH
+  );
+
+  int dirV = confirmDirection(
+      errorV,
+      activeV,
+      candidateV,
+      countV
+  );
+
+  // ---------- HORIZONTAL ----------
+
+  if (dirH != 0) {
+
+    float adjustment =
+        KP * fabsf(errorH);
+
+    adjustment = constrain(
+        adjustment,
+        0.0f,
+        MAX_TARGET_CHANGE
+    );
+
+    targetH +=
+        dirH * H_DIRECTION * adjustment;
+
+  } else {
+
+    // Prevent chasing tiny errors.
+    targetH = posH;
+  }
+
+  // ---------- VERTICAL ----------
+
+  if (dirV != 0) {
+
+    float adjustment =
+        KP * fabsf(errorV);
+
+    adjustment = constrain(
+        adjustment,
+        0.0f,
+        MAX_TARGET_CHANGE
+    );
+
+    targetV +=
+        dirV * V_DIRECTION * adjustment;
+
+  } else {
+
+    targetV = posV;
+  }
+
+  // Enforce safe angle limits.
+
+  targetH = constrain(
+      targetH,
+      (float)H_MIN,
+      (float)H_MAX
+  );
+
+  targetV = constrain(
+      targetV,
+      (float)V_MIN,
+      (float)V_MAX
+  );
+}
+
+// ==========================================================
+// 14. SMOOTH SERVO MOVEMENT
+// ==========================================================
+
+void updateServos() {
+
+  int requestedH = (int)roundf(targetH);
+  int requestedV = (int)roundf(targetV);
+
+  // ---------- HORIZONTAL ----------
+
+  if (posH < requestedH) {
+
+    posH = min(
+        posH + SERVO_STEP,
+        requestedH
+    );
+
+    servoH.write(posH);
+
+  } else if (posH > requestedH) {
+
+    posH = max(
+        posH - SERVO_STEP,
+        requestedH
+    );
+
+    servoH.write(posH);
+  }
+
+  // ---------- VERTICAL ----------
+
+  if (posV < requestedV) {
+
+    posV = min(
+        posV + SERVO_STEP,
+        requestedV
+    );
+
+    servoV.write(posV);
+
+  } else if (posV > requestedV) {
+
+    posV = max(
+        posV - SERVO_STEP,
+        requestedV
+    );
+
+    servoV.write(posV);
+  }
+}
+
+// ==========================================================
+// 15. SERIAL MONITOR
+// ==========================================================
+
+// ==========================================================
+// DS18B20 TEMPERATURE (NON-BLOCKING)
+// This function does not delay tracking/servo updates.
+// ==========================================================
+
+void updateTemperature(unsigned long now) {
+
+  // Read only after the 12-bit conversion has completed.
+  if (tempConversionPending &&
+      now - lastTempRequest >= TEMP_CONVERSION_MS) {
+
+    float reading = temperatureSensor.getTempCByIndex(0);
+
+    if (reading != DEVICE_DISCONNECTED_C &&
+        isfinite(reading) &&
+        reading >= -55.0f && reading <= 125.0f) {
+      tempC = reading;
+      tempValid = true;
+    } else {
+      tempValid = false;
+    }
+
+    tempConversionPending = false;
+  }
+
+  // Start the next measurement without blocking the servos.
+  if (!tempConversionPending &&
+      now - lastTempRequest >= TEMP_INTERVAL) {
+    temperatureSensor.requestTemperatures();
+    lastTempRequest = now;
+    tempConversionPending = true;
+  }
+}
+
+// ==========================================================
+// INA219 + 16x2 I2C LCD ADDITIONS
+// Original LDR, servo and DS18B20 functions above unchanged.
+// ==========================================================
+
+bool i2cResponds(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void initializeI2CDevices() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+
+  // Same address-scanning approach as the supplied test sketch.
+  Serial.println("=== I2C Scanner (SDA=21, SCL=22) ===");
+  int count = 0;
+  bool lcd27Found = false;
+  bool lcd3FFound = false;
+  bool inaFound = false;
+
+  for (uint8_t address = 1; address < 127; ++address) {
+    if (i2cResponds(address)) {
+      Serial.print("I2C device at 0x");
+      if (address < 16) Serial.print('0');
+      Serial.println(address, HEX);
+      ++count;
+      if (address == 0x27) lcd27Found = true;
+      if (address == 0x3F) lcd3FFound = true;
+      if (address == INA_I2C_ADDR) inaFound = true;
+    }
+  }
+
+  if (count == 0) Serial.println("No I2C devices found; check wiring.");
+
+  if (lcd27Found) lcd = &lcd27;
+  else if (lcd3FFound) lcd = &lcd3F;
+
+  if (lcd != nullptr) {
+    lcd->init();
+    lcd->backlight();
+    lcd->setCursor(0, 0);
+    lcd->print("SOLAR TRACKER   ");
+    lcd->setCursor(0, 1);
+    lcd->print("LCD INITIALIZED ");
+    Serial.println("LCD ready.");
+  } else {
+    Serial.println("LCD not found at 0x27/0x3F; tracking continues.");
+  }
+
+  // Never read an absent INA219: avoids misleading 0V/0A data.
+  if (inaFound && ina219.begin()) {
+    inaReady = true;
+    Serial.println("INA219 ready at 0x40.");
+  } else {
+    Serial.println("INA219 not found at 0x40; tracking continues.");
+  }
+}
+
+void updateElectrical() {
+  if (!inaReady || !i2cResponds(INA_I2C_ADDR)) {
+    inaValid = false;
+    return;
+  }
+
+  // V- (load side) voltage plus shunt drop = source-side voltage.
+  float bus_V = ina219.getBusVoltage_V();
+  float shunt_mV = ina219.getShuntVoltage_mV();
+  float current_mA = ina219.getCurrent_mA();
+  float power_mW = ina219.getPower_mW();
+
+  if (isfinite(bus_V) && isfinite(shunt_mV) &&
+      isfinite(current_mA) && isfinite(power_mW)) {
+    solarVoltage_V = bus_V + shunt_mV / 1000.0f;
+    solarCurrent_mA = current_mA;
+    solarPower_mW = power_mW;  // Power delivered to load side.
+    inaValid = true;
+  } else {
+    inaValid = false;
+  }
+}
+
+// Pad to 16 characters and only update changed LCD sections.
+// This minimizes I2C traffic and avoids lcd.clear() flicker.
+void lcdWriteRow(uint8_t row, const char* message) {
+  if (lcd == nullptr || row > 1) return;
+  static char previous[2][17] = {{0}, {0}};
+  char padded[17];
+  uint8_t i = 0;
+  while (i < 16 && message[i] != '\0') {
+    padded[i] = message[i];
+    ++i;
+  }
+  while (i < 16) padded[i++] = ' ';
+  padded[16] = '\0';
+
+  for (int index = 0; index < 16;) {
+    if (previous[row][index] == padded[index]) {
+      ++index;
+      continue;
+    }
+    int start = index;
+    char changed[17];
+    int count = 0;
+    while (index < 16 && previous[row][index] != padded[index]) {
+      changed[count++] = padded[index];
+      previous[row][index] = padded[index];
+      ++index;
+    }
+    changed[count] = '\0';
+    lcd->setCursor(start, row);
+    lcd->print(changed);
+  }
+}
+
+void updateLCD(unsigned long now) {
+  if (lcd == nullptr) return;
+
+  char line1[17];
+  char line2[17];
+  bool electricalPage = ((now / LCD_PAGE_DURATION) % 2UL) == 0;
+
+  if (electricalPage) {
+    if (inaValid) {
+      // Example: "V:13.50 I:0.25A" and "P:3.38W T:29.5C"
+      snprintf(line1, sizeof(line1), "V:%5.2f I:%4.2fA",
+               solarVoltage_V, solarCurrent_mA / 1000.0f);
+      if (tempValid) {
+        snprintf(line2, sizeof(line2), "P:%.2fW T:%.1fC",
+                 solarPower_mW / 1000.0f, tempC);
+      } else {
+        snprintf(line2, sizeof(line2), "P:%.2fW T:ERR",
+                 solarPower_mW / 1000.0f);
+      }
+    } else {
+      snprintf(line1, sizeof(line1), "INA219 NO DATA");
+      if (tempValid) snprintf(line2, sizeof(line2), "TEMP:%.1fC", tempC);
+      else snprintf(line2, sizeof(line2), "TEMP:NO SENSOR");
+    }
+  } else {
+    snprintf(line1, sizeof(line1), "H:%3d V:%3d", posH, posV);
+    if (!lightValid) snprintf(line2, sizeof(line2), "LIGHT HOLD");
+    else if (activeH == 0 && activeV == 0)
+      snprintf(line2, sizeof(line2), "STABLE");
+    else snprintf(line2, sizeof(line2), "TRACKING");
+  }
+
+  lcdWriteRow(0, line1);
+  lcdWriteRow(1, line2);
+}
+
+// ==========================================================
+// LCD NETWORK STATUS / IP OVERLAY
+// - While Wi-Fi connects: display connection status.
+// - Once reachable: keep browser IP visible until the dashboard is opened.
+// - After that: preserve the existing alternating LCD pages and
+//   show the IP again for 5 seconds every 20 seconds.
+// - If the router is unavailable, display offline status. No fallback hotspot.
+// Uses lcdWriteRow() so there is no extra lcd.clear() flicker.
+// ==========================================================
+void updateLCDWithNetwork(unsigned long now) {
+  if (lcd == nullptr) return;
+
+  bool stationConnected = (WiFi.status() == WL_CONNECTED);
+  if (!stationConnected) {
+    if (now - wifiStartMs < WIFI_CONNECT_TIMEOUT_MS) {
+      lcdWriteRow(0, "WiFi Connecting");
+      lcdWriteRow(1, "Please wait...");
+    } else {
+      lcdWriteRow(0, "WiFi Not Ready");
+      lcdWriteRow(1, "Check 2.4G WiFi");
+    }
+    return;
+  }
+
+  bool showIp = !dashboardOpened ||
+      ((now % IP_REMINDER_PERIOD_MS) < IP_REMINDER_SHOW_MS);
+
+  if (showIp) {
+    String ip = WiFi.localIP().toString();
+    lcdWriteRow(0, "Web Dashboard IP");
+    lcdWriteRow(1, ip.c_str());
+    return;
+  }
+
+  // Original solar electrical and tracking pages are unchanged.
+  updateLCD(now);
+}
+
+void printStatus() {
+
+  Serial.print("TOP:");
+  Serial.print(ldrTop, 0);
+
+  Serial.print(" BOTTOM:");
+  Serial.print(ldrBottom, 0);
+
+  Serial.print(" LEFT:");
+  Serial.print(ldrLeft, 0);
+
+  Serial.print(" RIGHT:");
+  Serial.print(ldrRight, 0);
+
+  Serial.print(" | ERR_H:");
+  Serial.print(errorH, 1);
+
+  Serial.print(" ERR_V:");
+  Serial.print(errorV, 1);
+
+  Serial.print(" | H:");
+  Serial.print(posH);
+
+  Serial.print(" V:");
+  Serial.print(posV);
+
+  Serial.print(" | TARGET_H:");
+  Serial.print(targetH, 1);
+
+  Serial.print(" TARGET_V:");
+  Serial.print(targetV, 1);
+
+  // Added temperature output to the existing Serial line.
+  Serial.print(" | TEMP:");
+  if (tempValid) {
+    Serial.print(tempC, 2);
+    Serial.print(" C");
+  } else {
+    Serial.print("SENSOR ERROR");
+  }
+
+  // Additional INA219 fields; all previous Serial fields are preserved.
+  Serial.print(" | INA219:");
+  if (inaValid) {
+    Serial.print(" V:");
+    Serial.print(solarVoltage_V, 2);
+    Serial.print("V I:");
+    Serial.print(solarCurrent_mA, 1);
+    Serial.print("mA P:");
+    Serial.print(solarPower_mW / 1000.0f, 2);
+    Serial.print("W");
+  } else {
+    Serial.print("NO DATA");
+  }
+
+  Serial.print(" | ");
+
+  if (!lightValid) {
+
+    Serial.println("LIGHT HOLD");
+
+  } else if (activeH == 0 && activeV == 0) {
+
+    Serial.println("STABLE");
+
+  } else {
+
+    Serial.println("TRACKING");
+  }
+}
+
+
+// ==========================================================
+// MANUAL BROWSER RELAY CONTROL — NO BATTERY PROTECTION
+// ==========================================================
+// Active-LOW relay: LOW=ON, HIGH=OFF. Defaults to OFF in setup.
+// If your specific relay module uses an active-HIGH input,
+// set RELAY_ACTIVE_LOW = false above.
+void setRelay(bool on) {
+  // Always command the pin, even if already in the requested state.
+  digitalWrite(RELAY_PIN,
+               on ? (RELAY_ACTIVE_LOW ? LOW : HIGH)
+                  : (RELAY_ACTIVE_LOW ? HIGH : LOW));
+  if (relayOn != on) {
+    relayOn = on;
+    Serial.printf("[RELAY] Manually switched %s from browser\n", on ? "ON" : "OFF");
+  }
+}
+
+// ==========================================================
+// LOCAL WEB SERVER / ROUTER-ONLY WI-FI (NO WEB LOGIN)
+// ==========================================================
+String jsonFloat(float value, int digits, bool valid=true) {
+  return (valid && isfinite(value)) ? String(value, digits) : String("null");
+}
+
+void handleDashboard() {
+  dashboardOpened = true; // IP was seen and dashboard successfully opened.
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
+}
+
+void handleTelemetry() {
+  String j;
+  j.reserve(580);
+  j += "{\"solar_v\":"; j += jsonFloat(solarVoltage_V, 2, inaValid);
+  j += ",\"solar_a\":"; j += jsonFloat(solarCurrent_mA / 1000.0f, 3, inaValid);
+  j += ",\"solar_w\":"; j += jsonFloat(solarPower_mW / 1000.0f, 2, inaValid);
+  j += ",\"temp_c\":"; j += jsonFloat(tempC, 2, tempValid);
+  j += ",\"tracking\":\"";
+  j += !lightValid ? "LIGHT HOLD" : ((activeH == 0 && activeV == 0) ? "STABLE" : "TRACKING");
+  j += "\",\"h\":"; j += posH;
+  j += ",\"v\":"; j += posV;
+  j += ",\"top\":"; j += String(ldrTop, 0);
+  j += ",\"bottom\":"; j += String(ldrBottom, 0);
+  j += ",\"left\":"; j += String(ldrLeft, 0);
+  j += ",\"right\":"; j += String(ldrRight, 0);
+  j += ",\"error_h\":"; j += String(errorH, 1);
+  j += ",\"error_v\":"; j += String(errorV, 1);
+  j += ",\"relay_on\":"; j += relayOn ? "true" : "false";
+  j += "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", j);
+}
+
+void handleLoadControl() {
+  String command = server.arg("mode");
+  if (command == "on") {
+    setRelay(true);
+  } else if (command == "off") {
+    setRelay(false);
+  } else {
+    server.send(400, "text/plain", "Invalid mode. Use on or off.");
+    return;
+  }
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", relayOn ? "Relay ON" : "Relay OFF");
+}
+
+void beginLocalServer() {
+  server.on("/", HTTP_GET, handleDashboard);
+  server.on("/api/data", HTTP_GET, handleTelemetry);
+  server.on("/api/load", HTTP_POST, handleLoadControl);
+  server.onNotFound([]() {
+      server.send(404, "text/plain", "Not found");
+  });
+  server.begin();
+  Serial.println("[WEB] Local dashboard ready (no separate web login; private LAN only).");
+}
+
+// Connect ONLY to the configured router; never start a public ESP32 hotspot.
+void initializeWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD); // non-blocking; tracking continues
+  wifiStartMs = millis();
+  lastWifiRetry = wifiStartMs;
+  Serial.println("[WiFi] Connecting to configured network (no AP fallback).");
+  beginLocalServer();
+}
+
+void maintainWifi(unsigned long now) {
+  if (now - lastWifiCheck < 3000) return;
+  lastWifiCheck = now;
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected && !stationLoggedIn) {
+    stationLoggedIn = true;
+    dashboardOpened = false;
+    Serial.print("[WiFi] Open in browser: http://");
+    Serial.println(WiFi.localIP());
+  } else if (!connected && stationLoggedIn) {
+    stationLoggedIn = false;
+    dashboardOpened = false;
+    Serial.println("[WiFi] Network lost; retrying. Tracking continues.");
+  }
+  if (!connected && now - lastWifiRetry >= WIFI_CONNECT_TIMEOUT_MS) {
+    lastWifiRetry = now;
+    WiFi.reconnect();
+    Serial.println("[WiFi] Reconnecting to configured router...");
+  }
+}
+
+// ==========================================================
+// 16. SETUP
+// ==========================================================
+
+void setup() {
+
+  // Added output: relay defaults OFF at startup before attaching servos/Wi-Fi.
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  Serial.begin(115200);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println(" ESP32 DUAL AXIS SOLAR TRACKER V3 ");
+  Serial.println("==================================");
+
+  analogReadResolution(12);
+
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(LDR_TOP_PIN, INPUT);
+  pinMode(LDR_BOTTOM_PIN, INPUT);
+  pinMode(LDR_LEFT_PIN, INPUT);
+  pinMode(LDR_RIGHT_PIN, INPUT);
+
+  // DS18B20: GPIO 4 data + 4.7k pull-up to 3.3V.
+  // Async mode avoids the default 750ms blocking conversion.
+  temperatureSensor.begin();
+  temperatureSensor.setResolution(12);
+  temperatureSensor.setWaitForConversion(false);
+
+  Serial.print("DS18B20 devices detected: ");
+  Serial.println(temperatureSensor.getDeviceCount());
+
+  temperatureSensor.requestTemperatures();
+  lastTempRequest = millis();
+  tempConversionPending = true;
+
+  // Added I2C initialization. Original servo setup below unchanged.
+  initializeI2CDevices();
+
+  // Initialize PWM.
+
+  servoH.setPeriodHertz(50);
+  servoV.setPeriodHertz(50);
+
+  servoH.attach(
+      SERVO_H_PIN,
+      SERVO_MIN_US,
+      SERVO_MAX_US
+  );
+
+  servoV.attach(
+      SERVO_V_PIN,
+      SERVO_MIN_US,
+      SERVO_MAX_US
+  );
+
+  // Center at startup.
+
+  posH = 90;
+  posV = 90;
+
+  targetH = posH;
+  targetV = posV;
+
+  servoH.write(posH);
+  servoV.write(posV);
+
+  delay(1200);
+
+  Serial.println("Servos initialized.");
+  Serial.println("Calibrate direction before loading.");
+  Serial.println("Tracking system started.");
+
+  // New subsystem initialization, original setup above unchanged.
+  initializeWifi();
+  updateLCDWithNetwork(millis()); // Show Wi-Fi status immediately.
+}
+
+// ==========================================================
+// 17. MAIN LOOP
+// ==========================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+  // ---------- SENSOR TASK ----------
+
+  if (now - lastSensor >= SENSOR_INTERVAL) {
+
+    lastSensor = now;
+
+    updateSensors();
+  }
+
+  if (!sensorReady) {
+    return;
+  }
+
+  // ---------- TRACKING TASK ----------
+
+  if (now - lastTrack >= TRACK_INTERVAL) {
+
+    lastTrack = now;
+
+    updateTracking();
+  }
+
+  // ---------- SERVO TASK ----------
+
+  if (now - lastServo >= SERVO_INTERVAL) {
+
+    lastServo = now;
+
+    updateServos();
+  }
+
+  // ---------- NON-BLOCKING TEMPERATURE TASK ----------
+  updateTemperature(now);
+
+  // ---------- INA219 TASK (1-second interval) ----------
+  if (now - lastINA >= INA_INTERVAL) {
+    lastINA = now;
+    updateElectrical();
+  }
+
+  // ---------- LCD TASK (1-second interval) ----------
+  if (now - lastLCD >= LCD_INTERVAL) {
+    lastLCD = now;
+    updateLCDWithNetwork(now);
+  }
+
+  // ---------- MONITOR TASK ----------
+
+  if (now - lastPrint >= PRINT_INTERVAL) {
+
+    lastPrint = now;
+
+    printStatus();
+  }
+
+  // Wi-Fi tasks: original tracking timing remains unchanged.
+  maintainWifi(now);
+  server.handleClient();
+}
+
+// ====================== END ================================
