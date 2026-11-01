@@ -14,8 +14,6 @@ Beyond the tracking mechanism, the prototype integrates an **INA219** for solar-
 
 The current **V7 firmware** connects to an existing **2.4 GHz Wi-Fi network**. The LCD displays the dashboard's IP address until the browser page is opened, then resumes its measurement pages with periodic IP reminders. The system **does not create its own Wi-Fi hotspot**, **does not require a separate web login**, and **does not provide automatic battery low-voltage protection**.
 
-> **Development status:** Automatic tracking was demonstrated under indoor/controlled lighting. Outdoor testing revealed LDR ADC saturation (`4095` on all four channels), so full-sun tracking performance remains an identified limitation—not a completed validation.
-
 ---
 
 ## 📸 System Image
