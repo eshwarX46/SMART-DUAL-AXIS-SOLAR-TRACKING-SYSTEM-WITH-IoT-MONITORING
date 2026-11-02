@@ -241,8 +241,6 @@ Install third-party libraries through **Arduino IDE → Library Manager**. Selec
 8. **Connect your phone/computer to the same 2.4 GHz Wi-Fi network**. Read the IP shown on the LCD and visit `http://<ESP32_IP>`.
 9. **Check live values and manual relay switching** first with a low-risk test load. Add protected solar/charging wiring only after confirming your hardware's electrical requirements.
 
-> The repository copy of the sketch intentionally contains **Wi-Fi placeholders**. Keep your real SSID/password out of public commits.
-
 ---
 
 ## Demonstration and Observed Results
